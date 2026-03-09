@@ -1,11 +1,9 @@
 import { createApiClient } from "./apiClient";
 
 /**
- * NOTE:
- * The current backend container appears to expose only a health endpoint GET /.
- * This module provides:
- * 1) a "real" adapter (api) for when endpoints exist
- * 2) a mock adapter for local UI completeness
+ * Backend adapter:
+ * - Real adapter matches the Express API in team-task-management-system-330339/express_backend.
+ * - Mock adapter keeps UI usable when backend is unavailable.
  *
  * Switching rule:
  * - If REACT_APP_USE_MOCK_API === "true", use mock.
@@ -58,13 +56,91 @@ function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
+const STATUS_TO_ENUM = {
+  Todo: "todo",
+  "In Progress": "in_progress",
+  Blocked: "blocked",
+  Done: "done",
+  Archived: "archived"
+};
+
+const ENUM_TO_STATUS = Object.fromEntries(
+  Object.entries(STATUS_TO_ENUM).map(([label, value]) => [value, label])
+);
+
+const PRIORITY_TO_ENUM = {
+  Low: "low",
+  Medium: "medium",
+  High: "high",
+  Urgent: "urgent"
+};
+
+const ENUM_TO_PRIORITY = Object.fromEntries(
+  Object.entries(PRIORITY_TO_ENUM).map(([label, value]) => [value, label])
+);
+
+function toBackendTaskPayload(uiPayload) {
+  // UI uses friendly labels; backend uses enum values.
+  return {
+    title: uiPayload.title,
+    description: uiPayload.description || null,
+    status: STATUS_TO_ENUM[uiPayload.status] || uiPayload.status || undefined,
+    priority: PRIORITY_TO_ENUM[uiPayload.priority] || uiPayload.priority || undefined,
+    dueDate: uiPayload.dueDate || null,
+    startDate: uiPayload.startDate || null,
+    // UI uses free-text assignee; backend uses assignedToUserId.
+    // Keep it null until we add a user picker.
+    assignedToUserId: null
+  };
+}
+
+function normalizeTaskFromBackend(t) {
+  if (!t) return t;
+
+  return {
+    id: t.id,
+    projectId: t.project_id ?? t.projectId,
+    title: t.title,
+    description: t.description ?? "",
+    status: ENUM_TO_STATUS[t.status] || t.status,
+    priority: ENUM_TO_PRIORITY[t.priority] || t.priority,
+    dueDate: t.due_date ?? t.dueDate ?? "",
+    startDate: t.start_date ?? t.startDate ?? "",
+    assignee: "" // UI-only
+  };
+}
+
+function normalizeProjectFromBackend(p) {
+  if (!p) return p;
+  return {
+    id: p.id,
+    name: p.name,
+    description: p.description ?? "",
+    status: p.status,
+    createdAt: p.created_at ?? p.createdAt,
+    updatedAt: p.updated_at ?? p.updatedAt
+  };
+}
+
+function normalizeUserFromBackend(u) {
+  if (!u) return u;
+  return {
+    id: u.id,
+    // Frontend uses `name`; backend uses `fullName`.
+    name: u.fullName ?? u.full_name ?? u.name ?? "",
+    email: u.email,
+    role: u.role
+  };
+}
+
 // PUBLIC_INTERFACE
 export function createBackend(getToken) {
   /**
-   * Backend adapter (contract-first):
-   * - Auth: login/register/me/logout
-   * - Projects: list/create/update/delete
-   * - Tasks: list/create/update/delete + filtering
+   * Backend adapter (real):
+   * - Auth: /auth/login, /auth/register
+   * - Profile: /profile/me (GET/PATCH)
+   * - Projects: /projects (GET/POST) and /projects/:id (PATCH/DELETE)
+   * - Tasks: /projects/:projectId/tasks (GET/POST) and /tasks/:taskId (GET/PATCH/DELETE)
    *
    * Errors are thrown as {message,status,data} similar to apiClient.
    */
@@ -74,28 +150,100 @@ export function createBackend(getToken) {
     return {
       health: () => api.get("/"),
       auth: {
-        login: (payload) => api.post("/auth/login", payload),
-        register: (payload) => api.post("/auth/register", payload),
-        me: () => api.get("/me"),
+        login: async (payload) => {
+          const res = await api.post("/auth/login", payload);
+          // Express returns: { accessToken, tokenType, user }
+          return {
+            token: res.accessToken,
+            tokenType: res.tokenType,
+            user: normalizeUserFromBackend(res.user)
+          };
+        },
+        register: async (payload) => {
+          // UI sends {name,email,password}; backend expects {email,password,fullName}
+          const res = await api.post("/auth/register", {
+            email: payload.email,
+            password: payload.password,
+            fullName: payload.name
+          });
+          return {
+            token: res.accessToken,
+            tokenType: res.tokenType,
+            user: normalizeUserFromBackend(res.user)
+          };
+        },
+        me: async () => {
+          const me = await api.get("/profile/me");
+          return normalizeUserFromBackend(me);
+        },
         logout: () => Promise.resolve()
       },
       projects: {
-        list: () => api.get("/projects"),
-        create: (payload) => api.post("/projects", payload),
-        update: (id_, payload) => api.put(`/projects/${id_}`, payload),
+        list: async () => {
+          const res = await api.get("/projects");
+          const items = res?.items || [];
+          return items.map(normalizeProjectFromBackend);
+        },
+        create: async (payload) => normalizeProjectFromBackend(await api.post("/projects", payload)),
+        update: async (id_, payload) =>
+          normalizeProjectFromBackend(await api.patch(`/projects/${id_}`, payload)),
         remove: (id_) => api.del(`/projects/${id_}`)
       },
       tasks: {
-        list: (query) => {
-          const qs = query ? `?${new URLSearchParams(query).toString()}` : "";
-          return api.get(`/tasks${qs}`);
+        list: async (query = {}) => {
+          // UI provides filters including optional projectId.
+          // Backend task listing is per-project, so:
+          // - if projectId is given, query that project's tasks.
+          // - otherwise, perform a global search via /search?type=tasks to simulate "all tasks".
+          const { projectId, q, status, priority } = query || {};
+
+          if (projectId) {
+            const res = await api.get(
+              `/projects/${projectId}/tasks?${new URLSearchParams({
+                ...(q ? { q } : {}),
+                ...(status ? { status: STATUS_TO_ENUM[status] || status } : {}),
+                ...(priority ? { priority: PRIORITY_TO_ENUM[priority] || priority } : {})
+              }).toString()}`
+            );
+            return (res?.items || []).map(normalizeTaskFromBackend);
+          }
+
+          const res = await api.get(
+            `/search?${new URLSearchParams({
+              type: "tasks",
+              ...(q ? { q } : {}),
+              ...(status ? { status: STATUS_TO_ENUM[status] || status } : {}),
+              ...(priority ? { priority: PRIORITY_TO_ENUM[priority] || priority } : {})
+            }).toString()}`
+          );
+
+          return (res?.tasks || []).map(normalizeTaskFromBackend);
         },
-        create: (payload) => api.post("/tasks", payload),
-        update: (id_, payload) => api.put(`/tasks/${id_}`, payload),
-        remove: (id_) => api.del(`/tasks/${id_}`)
+        create: async (uiPayload) => {
+          const projectId = uiPayload.projectId;
+          const created = await api.post(
+            `/projects/${projectId}/tasks`,
+            toBackendTaskPayload(uiPayload)
+          );
+          return normalizeTaskFromBackend(created);
+        },
+        update: async (taskId, uiPayload) => {
+          const updated = await api.patch(`/tasks/${taskId}`, toBackendTaskPayload(uiPayload));
+          return normalizeTaskFromBackend(updated);
+        },
+        remove: (taskId) => api.del(`/tasks/${taskId}`)
       },
       users: {
-        updateProfile: (payload) => api.put("/me", payload)
+        updateProfile: async (payload) => {
+          // UI uses {name,email,role}; backend supports {fullName}
+          const updated = await api.patch("/profile/me", {
+            fullName: payload.name
+          });
+          return normalizeUserFromBackend(updated);
+        }
+      },
+      dashboard: {
+        summary: () => api.get("/dashboard")
       }
     };
   }

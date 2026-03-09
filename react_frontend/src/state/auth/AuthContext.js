@@ -64,10 +64,13 @@ export function AuthProvider({ children }) {
       setLoading(true);
       try {
         const res = await backend.auth.login({ email, password });
-        if (!res || !res.token || !res.user) {
+        const tokenFromRes = res?.token || res?.accessToken || null;
+        const userFromRes = res?.user || null;
+
+        if (!tokenFromRes || !userFromRes) {
           throw { message: "Invalid login response from server", status: 500, data: res };
         }
-        setSession(res.token, res.user);
+        setSession(tokenFromRes, userFromRes);
       } finally {
         setLoading(false);
       }
@@ -80,10 +83,13 @@ export function AuthProvider({ children }) {
       setLoading(true);
       try {
         const res = await backend.auth.register({ name, email, password });
-        if (!res || !res.token || !res.user) {
+        const tokenFromRes = res?.token || res?.accessToken || null;
+        const userFromRes = res?.user || null;
+
+        if (!tokenFromRes || !userFromRes) {
           throw { message: "Invalid register response from server", status: 500, data: res };
         }
-        setSession(res.token, res.user);
+        setSession(tokenFromRes, userFromRes);
       } finally {
         setLoading(false);
       }
